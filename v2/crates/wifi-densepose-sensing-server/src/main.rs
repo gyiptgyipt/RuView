@@ -371,6 +371,13 @@ struct NodeState {
     latest_vitals: VitalSigns,
     pub(crate) last_frame_time: Option<std::time::Instant>,
     edge_vitals: Option<Esp32VitalsPacket>,
+    /// ADR-110 §A0.12: Latest sync packet received from this node. When a
+    /// CSI frame arrives with byte 19 bit 4 set (`adr018_flags.ieee802154_sync_valid`),
+    /// the host can recover a mesh-aligned timestamp via
+    /// `latest_sync.epoch_us + (now_local - latest_sync.local_us)`.
+    latest_sync: Option<wifi_densepose_hardware::SyncPacket>,
+    /// Last time a sync packet from this node was received (for staleness).
+    latest_sync_at: Option<std::time::Instant>,
     /// Latest extracted features for cross-node fusion.
     latest_features: Option<FeatureInfo>,
     // ── RuVector Phase 2: Temporal smoothing & coherence gating ──
@@ -434,6 +441,8 @@ impl NodeState {
             latest_vitals: VitalSigns::default(),
             last_frame_time: None,
             edge_vitals: None,
+            latest_sync: None,
+            latest_sync_at: None,
             latest_features: None,
             prev_keypoints: None,
             motion_energy_history: VecDeque::with_capacity(COHERENCE_WINDOW),
@@ -4144,6 +4153,37 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     s.latest_update = Some(update);
                     s.edge_vitals = Some(vitals);
                     continue;
+                }
+
+                // ADR-110 §A0.12: Try sync packet (magic 0xC511_A110).
+                // A 32-byte UDP datagram carrying mesh-aligned epoch + sequence
+                // high-water from the node's c6_sync_espnow EMA-smoothed offset.
+                // Stored per-node so subsequent CSI frames with byte 19 bit 4
+                // set can have an aligned timestamp recovered downstream.
+                if len >= wifi_densepose_hardware::SYNC_PACKET_SIZE {
+                    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    if magic == wifi_densepose_hardware::SYNC_PACKET_MAGIC {
+                        match wifi_densepose_hardware::SyncPacket::from_bytes(&buf[..len]) {
+                            Ok(sync) => {
+                                debug!("ESP32 sync from {src}: node={} leader={} valid={} smoothed={} \
+                                        seq={} offset_us={}",
+                                       sync.node_id, sync.flags.is_leader, sync.flags.is_valid,
+                                       sync.flags.smoothed_used, sync.sequence,
+                                       sync.local_minus_epoch_us());
+                                let mut s = state.write().await;
+                                let ns = s.node_states.entry(sync.node_id)
+                                    .or_insert_with(NodeState::new);
+                                ns.latest_sync = Some(sync);
+                                ns.latest_sync_at = Some(std::time::Instant::now());
+                                continue;
+                            }
+                            Err(e) => {
+                                debug!("Sync packet decode error from {src}: {e}");
+                                // Fall through — magic matched but decode failed; not a CSI frame.
+                                continue;
+                            }
+                        }
+                    }
                 }
 
                 // ADR-040: Try WASM output packet (magic 0xC511_0004).
