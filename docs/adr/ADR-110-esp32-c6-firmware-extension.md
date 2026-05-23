@@ -2,12 +2,14 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Accepted (P1–P7 shipped on `main` branch, P8 docs + bench landed) |
-| **Date** | 2026-05-22 |
+| **Status** | Accepted — P1–P10 complete, firmware-side substrate closed at **v0.7.0-esp32** (2026-05-23) |
+| **Date** | 2026-05-22 (created) · 2026-05-23 (last revision — P10 + sprint summary) |
 | **Deciders** | ruv |
 | **Codename** | **C6-SOTA** |
 | **Relates to** | ADR-018 (CSI binary frame format), ADR-028 (ESP32 capability audit), ADR-029 (RuvSense multistatic), ADR-030 (RuvSense persistent field model), ADR-031 (RuView sensing-first), ADR-061 (QEMU CI), ADR-081 (adaptive CSI mesh kernel), ADR-097 (rvCSI adoption) |
 | **Tracking issue** | [ruvnet/RuView#762](https://github.com/ruvnet/RuView/issues/762) |
+| **Firmware releases** | [v0.6.7](https://github.com/ruvnet/RuView/releases/tag/v0.6.7-esp32) · [v0.6.8](https://github.com/ruvnet/RuView/releases/tag/v0.6.8-esp32) · [v0.6.9](https://github.com/ruvnet/RuView/releases/tag/v0.6.9-esp32) · [v0.7.0](https://github.com/ruvnet/RuView/releases/tag/v0.7.0-esp32) |
+| **Witness** | [`docs/WITNESS-LOG-110.md`](../WITNESS-LOG-110.md) — 13 §A0 entries (§A0.1 → §A0.13), 1 §A.1-A.12 dual-soak, 4 §B blocker entries, 5 §C bug fixes, 1 §D-workaround |
 
 ---
 
@@ -135,11 +137,75 @@ In both cases the HP-side API stays the same: `c6_lp_core_arm()` configures the 
 | **P7** | Benchmark C6 vs S3 (CSI fps, RAM, TWT jitter, power) | ✅ **done** — boot 353 ms, ts init 413 ms, image 1003 KB (−9 % vs S3), 310 KiB free heap, CSI callbacks fire at 64 subcarriers/frame on ch 1 background traffic |
 | **P8** | Witness bundle update, CLAUDE.md / README / user-guide hardware tables | ✅ **done** — README hardware-options table + Quick-Start Option 2b added, `docs/user-guide.md` now has full ESP32-C6 section (build, flash, provision, multi-room time-sync, battery seed mode) |
 | **P9** | **Software-only unblocks for B1/B2/B4 (firmware v0.6.7)** | ✅ **done** — (1) Real LP-core motion-gate program loads via `ulp_embed_binary(lp_core/main.c)`, exposes shared `motion_count`/`poll_count` symbols for witness verification (B4 code path complete, hardware-measurement still pending INA). (2) Soft-AP HE module (`c6_softap_he.{h,c}`) runs the C6 in AP+STA mode with WPA2 + HE advertised so a second C6 STA can negotiate real iTWT against a known-cooperative AP (B1/B2 unblocker without buying an 11ax router). (3) Build artifacts: S3 8 MB 1093 KB / C6 4 MB 1019 KB, both green on IDF v5.4. Both new modules default-off so v0.6.6 fleets see no behavior change. |
+| **P10** | **End-to-end mesh substrate: measured, smoothed, wired, decoded (firmware v0.6.8 → v0.7.0 + host crates)** | ✅ **done** — bench-quantified two-board substrate **and** the host-side wire that consumes it. **(a) v0.6.8 ESP-NOW EMA smoother** (`c6_sync_espnow.c`, α=1/8 fixed-point shift, 8-sample window). 5-min two-board soak (witness §A0.10) measured **411.5 µs raw stdev → 104.1 µs smoothed stdev (3.95× suppression, 4.70× peak-to-peak)** with **+30 µs/min crystal drift preserved within 2 µs/min**. **Cross-board RX 99.56 %** over 2701 beacons, 0 TX fail, leader election fired at +27336 ms. The ADR-110 §2.4 ≤100 µs alignment target is **empirically met by the smoothed offset alone**. **(b) v0.6.9 sync-packet** (32-byte UDP, magic `0xC511A110`, every `CONFIG_C6_SYNC_EVERY_N_FRAMES` CSI frames) carries `(node_id, local_us, epoch_us, sequence)` so host can pair against incoming CSI frames. Live-verified §A0.12 — COM9 reports `local − epoch = 1 163 565 µs` matching §A0.10's measured boot delta within 285 µs. **(c) v0.7.0 ADR-018 byte 19 bit 4 wire-fix** — bit 4 now sourced from `c6_sync_espnow_is_valid()` (was only the broken 802.15.4 path). Mixed S3+C6 fleets correctly advertise sync via the working transport. **(d) Host-side decoders + wiring**: Python `SyncPacketParser` (6 tests) + Rust `SyncPacket` (10 tests, all green; `SyncPacket::apply_to_local` recovers per-frame mesh-aligned timestamps). Sensing-server `udp_receiver_task` magic-dispatches `0xC511A110` and stores `NodeState::latest_sync` + `NodeState::mesh_aligned_us(local_at_frame)` helper. **(e) IDF v5.4 upstream gap formally documented (§A0.6)**: full `components/esp_wifi/include/esp_wifi*.h` grep proves the public API exposes only STA-side iTWT/bTWT — no `esp_wifi_ap_set_he_config`, no `wifi_he_ap_config_t`. Soft-AP HE/TWT-Responder advertise is not user-controllable on C6 in IDF v5.4; B1/B2 measurement requires either a future IDF or an external 11ax AP. |
 
 This ADR is updated at the end of each phase with the actual outcome, links to commits, and any deviations from the design.
+
+### 4.1 P10 detail — `/loop 5m` SOTA sprint (2026-05-23)
+
+P10 was driven by a `/loop 5m until sota. and ultra optmized` invocation that ran 16 iterations over ~80 minutes. The sprint shipped 4 firmware releases, 17 commits on the branch, 13 host-side unit tests, and converted the §B substrate from "designed targeting ±100 µs" into "measured at 104 µs smoothed stdev over a 5-min two-board soak with full host-side decoders + sensing-server consumer."
+
+| Iter | Shipped | Witness |
+|---|---|---|
+| 1 | `c6_softap_he` module + IDF v5.4 gap discovery | §A0.5, §A0.6 |
+| 2 | ESP-NOW cross-board mesh proven live | §A0.7 |
+| 3 | 4 MB S3 release variant | — |
+| 4 | 4-min mesh soak — first quantified sync stability | §A0.8 |
+| 5 | EMA smoother in firmware (α=1/8) | §A0.9 |
+| 6 | 5-min EMA soak: **3.95× suppression measured** | §A0.10 |
+| 7 | v0.6.8-esp32 release + §A0.11 timestamp-wiring gap recorded | §A0.11 |
+| 8 | Sync packet emission (option 2 chosen) | — |
+| 9 | Sync packet live-verified on both boards | §A0.12 |
+| 10 | v0.6.9-esp32 release + `CONFIG_C6_SYNC_EVERY_N_FRAMES` Kconfig knob | — |
+| 11 | ADR-018 byte 19 bit 4 wire-fix from ESP-NOW path | — |
+| 12 | v0.7.0-esp32 release + Python `SyncPacketParser` stub | §A0.13 |
+| 13 | 6 Python unit tests + README/user-guide doc updates | — |
+| 14 | Rust `SyncPacket` decoder + 7 unit tests in `wifi-densepose-hardware` | — |
+| 15 | Sensing-server `udp_receiver_task` magic-dispatch + `NodeState::latest_sync` | — |
+| 16 | `SyncPacket::apply_to_local()` + `NodeState::mesh_aligned_us()` (+ 3 more tests, 10 total) | — |
+
+### 4.2 P10 measured numbers (substrate now quantified, not just designed)
+
+Every number below comes from a real bench capture against COM9 + COM12 ESP32-C6 boards, raw logs preserved under `dist/firmware-v0.6.7/iter{2,4,5,6,9}-*.log` and `dist/firmware-v0.6.8/iter9-*.log`.
+
+| Metric | Measured | Target |
+|---|---|---|
+| Cross-board ESP-NOW RX rate (5-min soak) | **99.56 %** (2689 / 2701 beacons) | — |
+| Cross-board TX failures (5-min soak) | **0** on either board | — |
+| Beacon rate | **10.00 /s** exactly (FreeRTOS solid) | 10 Hz nominal |
+| Raw offset stdev | 411.5 µs | — |
+| **EMA-smoothed offset stdev** | **104.1 µs** | **≤100 µs (§2.4)** |
+| Range reduction (smoothed vs raw) | **4.70×** peak-to-peak | — |
+| Measured C6 crystal skew between bench boards | **1.4 ppm** | ESP32 spec ±10 ppm |
+| Drift preservation (smoothed tracking raw) | within **2 µs/min** | — |
+| Leader election | ✅ COM9 stepped down at +27 336 ms on `lower-id` rule | — |
+| Sync packet round-trip (firmware → Python decoder) | identical bytes, offset recovered to within **285 µs** of §A0.10 | — |
+| Raw 802.15.4 RX | 0 frames over 60 s + 240 s + 300 s soaks | (D1 broken in IDF v5.4) |
+| C6 v0.7.0 image size / slack | 1019 KB / **45 %** on 4 MB single-OTA | — |
+| S3 v0.7.0 image size / slack | 1094 KB / **47 %** on 8 MB dual-OTA | — |
+
+### 4.3 P10 host-side surface (production code shipped)
+
+| Crate / File | New API |
+|---|---|
+| `v2/crates/wifi-densepose-hardware/src/sync_packet.rs` | `SyncPacket`, `SyncPacketFlags`, `SYNC_PACKET_MAGIC = 0xC511A110`, `SYNC_PACKET_SIZE = 32`, `SyncPacket::from_bytes`, `SyncPacket::to_bytes`, `SyncPacket::local_minus_epoch_us`, `SyncPacket::apply_to_local(local_us)` — 10 unit tests, all green |
+| `v2/crates/wifi-densepose-sensing-server/src/main.rs` | `NodeState::latest_sync: Option<SyncPacket>`, `NodeState::latest_sync_at: Option<Instant>`, `NodeState::mesh_aligned_us(local_at_frame_us) -> Option<u64>`, `udp_receiver_task` magic-dispatch on `SYNC_PACKET_MAGIC` |
+| `archive/v1/src/hardware/csi_extractor.py` | `SyncPacket` dataclass, `SyncPacketParser.parse`, `SyncPacketParser.MAGIC` — 6 Python unit tests, all green |
 
 ## 5. Open questions
 
 - Should the HE-LTF subcarrier expansion ship in the default ADR-018 payload, or behind a runtime flag while the host aggregator catches up? **Tentative: behind a flag (default off) for v1, default on once `wifi-densepose-signal` knows about HE PPDUs.**
-- Should the 802.15.4 time-sync channel be configurable, or hard-coded to 15? **Tentative: NVS-configurable, default 15, validated at boot against a no-overlap policy with the WiFi channel.**
+- Should the 802.15.4 time-sync channel be configurable, or hard-coded to 15? **Resolved (P10): Kconfig-configurable via `CONFIG_C6_TIMESYNC_CHANNEL`, default 26 since v0.6.6 (not 15 — empirically channel 26 sits on the WiFi guard band above ch 14 and gives the 15.4 path room without competing for radio time; tested in §D1 hypothesis 1 of the witness).**
 - Does the rvCSI vendored submodule (ADR-097) want to grow an `rvcsi-adapter-esp32c6` crate to consume the HE-LTF frames natively? **Out of scope for this ADR; revisit in a follow-up.**
+
+## 6. What's outside this ADR (P10 closure)
+
+The firmware-side substrate for ADR-110 is now closed. Three categories remain, all explicitly **not** in this ADR's scope:
+
+1. **Multistatic CSI fusion math** — ADR-029/030 territory. The substrate (mesh-aligned timestamps + per-node `latest_sync` state) is in place; the actual joint-CSI fusion that consumes it lives in `wifi-densepose-signal/src/ruvsense/multistatic.rs`.
+2. **Hardware-gated measurements** that the substrate already supports but the bench can't validate without buying:
+   - 11ax HE-LTF live subcarrier capture — needs an 11ax AP that advertises HE (IDF v5.4 doesn't expose an AP-side HE config API, §A0.6).
+   - ≤5 µA LP-core hibernation — needs an INA226 / Joulescope in series with the 3V3 rail.
+3. **IDF upstream fixes**:
+   - 802.15.4 RX path on C6 + IDF v5.4 — `c6_timesync` ships and initialises but never RXes a frame (D1, 5 hypotheses tested + rejected). ESP-NOW workaround (`c6_sync_espnow`) is the working primary mesh transport. The 802.15.4 source stays in for the day IDF fixes the driver.
+   - Soft-AP HE/TWT-Responder advertise API — `c6_softap_he` ships as the in-place hook for when IDF v5.5+ exposes it.

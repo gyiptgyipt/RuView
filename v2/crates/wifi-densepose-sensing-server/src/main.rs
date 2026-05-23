@@ -419,6 +419,23 @@ const NOVELTY_HISTORY_CAPACITY: usize = 64;
 const NOVELTY_SKETCH_VERSION: u16 = 1;
 
 impl NodeState {
+    /// ADR-110 §A0.12 timestamp recovery: given a CSI frame's node-local
+    /// `esp_timer_get_time()` snapshot, return the mesh-aligned epoch
+    /// computed from this node's most recent sync packet — or `None`
+    /// if no sync has been received yet, or the last one is too stale
+    /// (older than 3 × VALID_WINDOW_MS = 9 s, matching the firmware's own
+    /// staleness gate).
+    pub(crate) fn mesh_aligned_us(&self, local_at_frame_us: u64) -> Option<u64> {
+        let sync = self.latest_sync.as_ref()?;
+        let seen_at = self.latest_sync_at?;
+        // Drop stale syncs — firmware emits at ~0.5 Hz default, anything
+        // older than 9 s likely means the mesh transport dropped.
+        if seen_at.elapsed() > std::time::Duration::from_secs(9) {
+            return None;
+        }
+        Some(sync.apply_to_local(local_at_frame_us))
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             frame_history: VecDeque::new(),

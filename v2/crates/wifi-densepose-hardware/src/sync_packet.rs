@@ -121,6 +121,34 @@ impl SyncPacket {
         (self.local_us as i64) - (self.epoch_us as i64)
     }
 
+    /// Given a CSI frame's node-local `esp_timer_get_time()` snapshot,
+    /// recover the mesh-aligned timestamp using this sync packet as the
+    /// reference point.
+    ///
+    /// Math (all in node-local µs, see ADR-110 §A0.12):
+    ///
+    /// ```text
+    ///   offset           = epoch_us - local_us               (signed; this packet)
+    ///   mesh_epoch(frame) = local_at_frame_us + offset
+    ///                    = local_at_frame_us + (epoch_us - local_us)
+    /// ```
+    ///
+    /// On the leader this gives `≈ local_at_frame_us`. On a follower this
+    /// gives the mesh-aligned time aligned to the leader's clock within
+    /// the §A0.10 measured 104 µs stdev (the same EMA-smoothed offset
+    /// the firmware applied when it built this sync packet's `epoch_us`).
+    ///
+    /// Use this on the host side whenever a CSI frame arrives with
+    /// ADR-018 byte 19 bit 4 set: look up the matching node's most-recent
+    /// `SyncPacket`, call `apply_to_local(frame.local_us)`, stamp the
+    /// result on the frame for downstream multistatic fusion.
+    pub fn apply_to_local(&self, local_at_frame_us: u64) -> u64 {
+        // Compute the offset as a signed delta in the µs domain. Adding it
+        // back to the frame's local snapshot recovers the mesh epoch.
+        let offset = (self.epoch_us as i64).wrapping_sub(self.local_us as i64);
+        (local_at_frame_us as i64).wrapping_add(offset) as u64
+    }
+
     /// Serialize back to wire bytes (32 bytes, little-endian).
     pub fn to_bytes(&self) -> [u8; SYNC_PACKET_SIZE] {
         let mut out = [0u8; SYNC_PACKET_SIZE];
@@ -232,6 +260,53 @@ mod tests {
     #[test]
     fn sync_and_csi_magics_differ() {
         assert_ne!(SYNC_PACKET_MAGIC, crate::esp32_parser::ESP32_CSI_MAGIC);
+    }
+
+    /// Applying a sync packet to its own local_us must recover its own
+    /// epoch_us. Foundational identity for the math.
+    #[test]
+    fn apply_to_local_recovers_packet_epoch() {
+        let pkt = SyncPacket {
+            node_id: 9, proto_ver: 1,
+            flags: SyncPacketFlags { is_leader: false, is_valid: true, smoothed_used: true },
+            local_us: 28_798_450, epoch_us: 27_634_885, sequence: 20,
+        };
+        assert_eq!(pkt.apply_to_local(pkt.local_us), pkt.epoch_us);
+    }
+
+    /// A CSI frame's local timestamp arriving after the sync packet
+    /// gets the same offset applied — the µs delta between sync and frame
+    /// is preserved on both clocks.
+    #[test]
+    fn apply_to_local_preserves_inter_frame_delta() {
+        let pkt = SyncPacket {
+            node_id: 9, proto_ver: 1,
+            flags: SyncPacketFlags { is_leader: false, is_valid: true, smoothed_used: true },
+            local_us: 28_798_450, epoch_us: 27_634_885, sequence: 20,
+        };
+        // Frame arrives 100 ms after the sync packet on the follower's local clock.
+        let local_at_frame = pkt.local_us + 100_000;
+        let mesh_epoch = pkt.apply_to_local(local_at_frame);
+        // Mesh epoch should also be 100 ms after the sync packet's epoch.
+        assert_eq!(mesh_epoch, pkt.epoch_us + 100_000);
+        // Offset must equal local - epoch on both clocks.
+        assert_eq!(local_at_frame - mesh_epoch, pkt.local_us - pkt.epoch_us);
+    }
+
+    /// Leader sync packet has near-zero offset, so apply_to_local is
+    /// approximately identity (modulo the few µs call-stack delta).
+    #[test]
+    fn apply_to_local_on_leader_is_near_identity() {
+        let pkt = SyncPacket {
+            node_id: 12, proto_ver: 1,
+            flags: SyncPacketFlags { is_leader: true, is_valid: true, smoothed_used: false },
+            local_us: 28_864_932, epoch_us: 28_864_939, sequence: 20,
+        };
+        let frame_local = 30_000_000u64;
+        let mesh = pkt.apply_to_local(frame_local);
+        assert!((mesh as i64 - frame_local as i64).abs() <= 100,
+                "leader apply should be within 100 µs of identity, got {} delta",
+                mesh as i64 - frame_local as i64);
     }
 
     #[test]
