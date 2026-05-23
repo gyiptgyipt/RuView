@@ -16,6 +16,7 @@
 #include "stream_sender.h"
 #include "edge_processing.h"
 #include "c6_timesync.h"  /* ADR-110: 802.15.4 epoch for cross-node alignment */
+#include "c6_sync_espnow.h" /* ADR-110 §A0.11: mesh-aligned epoch for sync packet */
 
 #include <string.h>
 #include "esp_log.h"
@@ -293,6 +294,38 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
     if (info->buf && info->len > 0) {
         edge_enqueue_csi((const uint8_t *)info->buf, (uint16_t)info->len,
                          (int8_t)info->rx_ctrl.rssi, info->rx_ctrl.channel);
+    }
+
+    /* ADR-110 §A0.11 — Emit a sync-packet every SYNC_EVERY_N CSI frames so the
+     * host aggregator can pair node-local sequence numbers with the mesh-aligned
+     * epoch coming out of c6_sync_espnow_get_epoch_us(). Backwards-compatible
+     * with the ADR-018 frame format: new packet uses a distinct magic so the
+     * existing CSI parser can dispatch by first 4 bytes. */
+    {
+        #define SYNC_EVERY_N_FRAMES  20    /* ~1 Hz at the 20 Hz send-rate gate */
+        if ((s_cb_count % SYNC_EVERY_N_FRAMES) == 0) {
+            uint8_t sync[32];
+            uint32_t sync_magic = 0xC511A110u;    /* CSI-ADR-110 sync packet */
+            uint64_t local_us = (uint64_t)esp_timer_get_time();
+            uint64_t epoch_us = c6_sync_espnow_get_epoch_us();
+            int64_t  off_smooth = c6_sync_espnow_get_offset_us_smoothed();
+            uint8_t  flags = 0;
+            if (c6_sync_espnow_is_leader()) flags |= 0x01;
+            if (c6_sync_espnow_is_valid())  flags |= 0x02;
+            if (off_smooth != 0)            flags |= 0x04;
+
+            memcpy(&sync[0],  &sync_magic, 4);
+            sync[4] = s_node_id;
+            sync[5] = 0x01;                       /* protocol version */
+            sync[6] = flags;
+            sync[7] = 0;                          /* reserved */
+            memcpy(&sync[8],  &local_us, 8);
+            memcpy(&sync[16], &epoch_us, 8);
+            memcpy(&sync[24], &s_sequence, 4);    /* high-water seq for pairing */
+            uint32_t zero32 = 0;
+            memcpy(&sync[28], &zero32, 4);        /* reserved (room for leader_id low32) */
+            (void)stream_sender_send(sync, sizeof(sync));
+        }
     }
 }
 
